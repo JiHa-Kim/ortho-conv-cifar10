@@ -26,158 +26,60 @@ class FreqMuonCfg:
     eps: float = 1e-7
 
 
-# Cache: which rfft2 bins must be real (v=0 and v=M/2 when M even), for each M.
-_REAL_BINS_CACHE: Dict[int, torch.Tensor] = {}
-
-
-def _rfft2_real_bins(M: int, device: torch.device) -> torch.Tensor:
+def _zeropower_ns5_complex(
+    X: torch.Tensor,  # [B, m, n], complex64
+    *,
+    steps: int,
+    eps: float,
+) -> torch.Tensor:
     """
-    For rfft2 output shaped [M, M//2+1], bins at v=0 (and v=M/2 if M even) are self-conjugate
-    along the last axis and must be real for a real spatial signal.
-    Return linear indices into flattened freq dimension F = M*(M//2+1) for those bins.
+    Muon-style NS5 polynomial on native complex tensors.
+    Returns approx polar factor / orthogonalized update.
     """
-    if M in _REAL_BINS_CACHE and _REAL_BINS_CACHE[M].device == device:
-        return _REAL_BINS_CACHE[M]
-
-    W = M // 2 + 1
-    u = torch.arange(M, device=device)
-    v_list = [0]
-    if M % 2 == 0:
-        v_list.append(M // 2)
-    v = torch.tensor(v_list, device=device, dtype=torch.long)
-
-    # All (u, v in {0, M/2})
-    U = u[:, None].expand(M, v.numel())
-    V = v[None, :].expand(M, v.numel())
-    idx = (U * W + V).reshape(-1).contiguous()  # [M * (#v)]
-    _REAL_BINS_CACHE[M] = idx
-    return idx
-
-
-def _zeropower_ns5_split_complex(
-    Xre: torch.Tensor, Xim: torch.Tensor, steps: int, eps: float
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Muon-style NS5 polynomial, but operating on complex matrices represented as (Re, Im) float32.
-
-    Inputs:
-      Xre, Xim: [B, m, n] float32
-
-    Returns:
-      Qre, Qim: [B, m, n] float32  (approx polar(X) = U V^*)
-    """
-    assert Xre.ndim == 3 and Xim.ndim == 3
+    assert X.ndim == 3 and X.is_complex()
+    _, m, n = X.shape
     a, b, c = (3.4445, -4.7750, 2.0315)
-
-    # Frobenius normalize: denom = ||X||_F
-    denom = torch.sqrt(
-        (Xre * Xre).sum(dim=(-2, -1)) + (Xim * Xim).sum(dim=(-2, -1))
-    ).clamp_min(eps)
-    Xre = Xre / denom[:, None, None]
-    Xim = Xim / denom[:, None, None]
-
-    m, n = Xre.shape[-2], Xre.shape[-1]
-    transposed = False
-    if m > n:
-        Xre = Xre.transpose(-2, -1)
-        Xim = Xim.transpose(-2, -1)
-        transposed = True
-
+    norm = torch.linalg.matrix_norm(X, ord="fro", dim=(-2, -1), keepdim=True).clamp_min(eps)
+    X = X / norm
+    if transpose := m > n:
+        X = X.transpose(-2, -1)
     for _ in range(steps):
-        Xt_re_T = Xre.transpose(-2, -1)
-        Xt_im_T = Xim.transpose(-2, -1)
+        A = X @ X.mH      # [B, r, r]
+        X = a * X + (b * A + c * A @ A) @ X
+    if transpose:
+        X = X.transpose(-2, -1)
+    return X
 
-        # A = X X^H = (R+iI)(R^T - i I^T)
-        # Ar = R R^T + I I^T
-        # Ai = I R^T - R I^T
-        Ar = Xre @ Xt_re_T
-        Ar = Ar + (Xim @ Xt_im_T)
 
-        Ai = Xim @ Xt_re_T
-        Ai = Ai - (Xre @ Xt_im_T)
-
-        # A2 = A A
-        # (Ar+iAi)^2 = (Ar Ar - Ai Ai) + i(Ar Ai + Ai Ar)
-        ArAr = Ar @ Ar
-        AiAi = Ai @ Ai
-        Ar2 = ArAr - AiAi
-
-        ArAi = Ar @ Ai
-        AiAr = Ai @ Ar
-        Ai2 = ArAi + AiAr
-
-        # B = bA + cA2
-        Br = b * Ar + c * Ar2
-        Bi = b * Ai + c * Ai2
-
-        # BX = (Br+iBi)(R+iI) = (BrR - BiI) + i(BrI + BiR)
-        BrR = Br @ Xre
-        BiI = Bi @ Xim
-        Yre = BrR - BiI
-
-        BrI = Br @ Xim
-        BiR = Bi @ Xre
-        Yim = BrI + BiR
-
-        # X <- aX + BX
-        Xre = a * Xre + Yre
-        Xim = a * Xim + Yim
-
-    if transposed:
-        Xre = Xre.transpose(-2, -1)
-        Xim = Xim.transpose(-2, -1)
-
-    return Xre, Xim
+# _zeropower_ns5_complex = torch.compile(_zeropower_ns5_complex, mode="max-autotune")
 
 
 def _freq_muon_conv_update_batched(g32: torch.Tensor, cfg: FreqMuonCfg) -> torch.Tensor:
     """
     g32: [P, Cout, Cin, kH, kW] float32
     returns: [P, Cout, Cin, kH, kW] float32
-    Full-bin (no subsampling) frequency-domain Muon polar update on an MxM circular grid.
     """
     assert g32.ndim == 5 and g32.dtype == torch.float32
     P, Cout, Cin, kH, kW = g32.shape
     M = cfg.fft_size
+
     if kH > M or kW > M:
         raise ValueError(f"Kernel {kH}x{kW} > fft_size {M}. Increase --fft_size.")
 
-    device = g32.device
-    W = M // 2 + 1
-    F = M * W
+    # Full FFT on an MxM logical grid; PyTorch pads/trims automatically.
+    Khat = torch.fft.fft2(g32, s=(M, M), dim=(-2, -1), norm="ortho")  # [P, Cout, Cin, M, M]
 
-    # Pad to MxM (float32)
-    pad = torch.zeros((P, Cout, Cin, M, M), device=device, dtype=torch.float32)
-    pad[:, :, :, :kH, :kW] = g32
+    Kflat = Khat.permute(0, 3, 4, 1, 2).reshape(P * M * M, Cout, Cin)
+    Kflat = _zeropower_ns5_complex(Kflat, steps=cfg.ns_steps, eps=cfg.eps)
+    Khat2 = Kflat.reshape(P, M, M, Cout, Cin).permute(0, 3, 4, 1, 2)
 
-    # rfft2: [P, Cout, Cin, M, W] complex64 (real/imag float32)
-    Khat = torch.fft.rfft2(pad, dim=(-2, -1), norm="ortho")
+    # Back to spatial domain, then crop to original kernel support
+    upd_pad = torch.fft.ifft2(Khat2, s=(M, M), dim=(-2, -1), norm="ortho")
+    upd = upd_pad.real[:, :, :, :kH, :kW]
+    return upd.to(dtype=g32.dtype)
 
-    # Flatten freqs: [P*F, Cout, Cin] complex64
-    Kflat = Khat.permute(0, 3, 4, 1, 2).reshape(P * F, Cout, Cin)
 
-    # Split into real/imag views (float32)
-    Xre = Kflat.real
-    Xim = Kflat.imag
-
-    # Polar per frequency bin (full bins, full steps)
-    Qre, Qim = _zeropower_ns5_split_complex(Xre, Xim, steps=cfg.ns_steps, eps=cfg.eps)
-
-    # Enforce "must-be-real" bins for rfft2 (v=0 and v=M/2 if even)
-    real_f = _rfft2_real_bins(M, device=device)  # indices into [F]
-    base = (torch.arange(P, device=device) * F)[:, None]  # [P,1]
-    real_idx = (base + real_f[None, :]).reshape(-1)       # [P * (#real_f)]
-    Qim[real_idx] = 0.0
-
-    # Write back into Kflat in-place (no clone)
-    Kflat.real.copy_(Qre)
-    Kflat.imag.copy_(Qim)
-
-    # Unflatten and irfft2 back to spatial (real float32)
-    Khat2 = Kflat.reshape(P, M, W, Cout, Cin).permute(0, 3, 4, 1, 2)  # [P,Cout,Cin,M,W]
-    upd_pad = torch.fft.irfft2(Khat2, s=(M, M), dim=(-2, -1), norm="ortho")  # [P,Cout,Cin,M,M]
-
-    return upd_pad[:, :, :, :kH, :kW]
+_freq_muon_conv_update_batched = torch.compile(_freq_muon_conv_update_batched, mode="max-autotune")
 
 
 class MuonFreqUltraFast(torch.optim.Optimizer):
